@@ -1,0 +1,157 @@
+# =============================================================================
+# 云构建「未签名 IPA」——给没有 Mac 的人用
+#
+# 放到仓库的：  .github/workflows/ios-unsigned-ipa.yml
+#
+# 产物：<AppName>-unsigned.ipa（Payload/<AppName>.app，arm64，device 构建）
+#       这个包本身不能直装 iPhone，需要用 Sideloadly / AltStore 用你自己的
+#       Apple ID 重签后才能安装（详见同目录 README）。
+#
+# 已按 shengjidaguai-china/goutoujunshi-jev-chat 的实际结构预设：
+#   project = integrations/jev_ios/GoutouJunshi.xcodeproj
+#   scheme  = GoutouJunshi（仓库里唯一的 shared scheme）
+# =============================================================================
+name: iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "xcodeproj 相对路径"
+        required: false
+        default: "integrations/jev_ios/GoutouJunshi.xcodeproj"
+      scheme:
+        description: "Xcode scheme（留空则自动探测）"
+        required: false
+        default: "GoutouJunshi"
+  push:
+    paths:
+      - ".github/workflows/ios-unsigned-ipa.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 选用最新的 Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- 镜像里预装的 Xcode ---"
+          ls -d /Applications/Xcode*.app || true
+          latest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "${latest}" ]; then
+            echo "切换到 ${latest}"
+            sudo xcode-select -s "${latest}/Contents/Developer" || true
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i "ios" || true
+
+      - name: 确定 project / scheme
+        id: probe
+        shell: bash
+        env:
+          PROJ_INPUT: ${{ github.event.inputs.project }}
+          SCHEME_INPUT: ${{ github.event.inputs.scheme }}
+        run: |
+          set -euo pipefail
+          PROJ="${PROJ_INPUT:-integrations/jev_ios/GoutouJunshi.xcodeproj}"
+          if [ ! -d "${PROJ}" ]; then
+            echo "::error::找不到工程目录 ${PROJ}"
+            exit 1
+          fi
+          SCHEME="${SCHEME_INPUT:-}"
+          if [ -z "${SCHEME}" ]; then
+            SCHEME="$(xcodebuild -list -project "${PROJ}" 2>/dev/null \
+              | awk '/^[[:space:]]*Schemes:/{f=1;next} f && /^[[:space:]]*$/{exit} f{gsub(/^[[:space:]]+/,""); if(length($0)){print;exit}}')"
+          fi
+          [ -n "${SCHEME}" ] || SCHEME="GoutouJunshi"
+          echo "project=${PROJ}" >> "${GITHUB_OUTPUT}"
+          echo "scheme=${SCHEME}"  >> "${GITHUB_OUTPUT}"
+          echo "本次使用： project=${PROJ}  scheme=${SCHEME}"
+          xcodebuild -list -project "${PROJ}"
+
+      - name: 编译（关闭代码签名）
+        shell: bash
+        env:
+          PROJ: ${{ steps.probe.outputs.project }}
+          SCHEME: ${{ steps.probe.outputs.scheme }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "${PROJ}" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "${RUNNER_TEMP}/dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 组装 Payload 并打包 ipa
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR="${RUNNER_TEMP}/dd/Build/Products/Release-iphoneos"
+          APP="$(find "${PRODUCT_DIR}" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null || true)"
+          if [ -z "${APP}" ]; then
+            echo "::error::没有找到 .app，下面是产物目录："
+            ls -la "${PRODUCT_DIR}" || true
+            exit 1
+          fi
+          APP_NAME="$(basename "${APP}" .app)"
+          echo "找到 ${APP_NAME}.app"
+          echo "--- 内嵌扩展 ---"
+          ls "${APP}/PlugIns" 2>/dev/null || echo "(没有 PlugIns 目录)"
+
+          STAGE="${RUNNER_TEMP}/stage"
+          mkdir -p "${STAGE}/Payload"
+          cp -R "${APP}" "${STAGE}/Payload/"
+
+          IPA="${GITHUB_WORKSPACE}/${APP_NAME}-unsigned.ipa"
+          ( cd "${STAGE}" && ditto -c -k --sequesterRsrc --keepParent Payload "${IPA}" )
+
+          echo "ipa=${IPA}" >> "${GITHUB_OUTPUT}"
+          echo "app_name=${APP_NAME}" >> "${GITHUB_OUTPUT}"
+
+          echo "--- ipa 结构（前 20 行）---"
+          unzip -l "${IPA}" | head -n 20
+          echo "--- 可执行文件架构（应为 arm64）---"
+          BIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${APP}/Info.plist")"
+          file "${APP}/${BIN}" || true
+          echo "最小系统版本："
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "${APP}/Info.plist" || true
+          ls -lh "${IPA}"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoutouJunshi-unsigned-ipa
+          path: ${{ steps.pack.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 结果摘要
+        shell: bash
+        run: |
+          {
+            echo "### 构建完成"
+            echo ""
+            echo "- App：\`${{ steps.pack.outputs.app_name }}\`"
+            echo "- 产物：\`${{ steps.pack.outputs.ipa }}\`"
+            echo "- 这个包是**未签名**的，不能直接安装到 iPhone。"
+            echo "- 下一步：下载 artifact → 用 Sideloadly 以你的 Apple ID 重签安装。"
+          } >> "${GITHUB_STEP_SUMMARY}"
