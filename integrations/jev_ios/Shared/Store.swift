@@ -39,12 +39,20 @@ final class GoutouStore {
 
     init() throws {
         #if os(iOS)
-        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.group),
-              let defaults = UserDefaults(suiteName: Self.group) else {
-            throw GoutouError.invalid("共享配置未连接：请在 Xcode 为 App 与键盘配置相同 App Group 和开发者 Team")
+        // 免费签名 / Sideload 时 App Group entitlement 可能拿不到；工厂里若直接 throw，
+        // 整个 App 会在启动时就报「共享配置未连接」。所以先探测，不通就降级到本机私有目录：
+        // App 保持可用，与键盘的共享退化为不可用（键盘侧会提示未连接）。
+        if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.group),
+           let defaults = UserDefaults(suiteName: Self.group),
+           Self.sharedContainerUsable(container, defaults: defaults) {
+            self.container = container
+            self.defaults = defaults
+        } else {
+            let local = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            try? FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+            self.container = local
+            self.defaults = .standard
         }
-        self.container = container
-        self.defaults = defaults
         #else
         container = FileManager.default.temporaryDirectory.appendingPathComponent("goutou-ios-core-tests")
         defaults = UserDefaults(suiteName: "ai.goutoujunshi.core-tests")!
@@ -52,6 +60,23 @@ final class GoutouStore {
         purgeExpiredHandoff()
         captureMailbox.purge(relationship: relationship(), config: config())
         _ = keyboardSession()
+    }
+
+    /// App Group 是否真的可写可读：entitlement 缺失时 `containerURL` 可能返回路径但写不进去，
+    /// `UserDefaults(suiteName:)` 也可能返回一个写进去读不回来的空壳，所以两边都做一次写读探测。
+    private static func sharedContainerUsable(_ container: URL, defaults: UserDefaults) -> Bool {
+        let stamp = UUID().uuidString
+        defaults.set(stamp, forKey: "goutou.canary")
+        guard defaults.string(forKey: "goutou.canary") == stamp else { return false }
+        let probe = container.appendingPathComponent(".goutou.canary")
+        do {
+            try Data("ok".utf8).write(to: probe, options: .atomic)
+            let readable = (try? Data(contentsOf: probe))?.count == 2
+            try? FileManager.default.removeItem(at: probe)
+            return readable
+        } catch {
+            return false
+        }
     }
 
     init(defaults: UserDefaults, container: URL) {
@@ -191,39 +216,101 @@ final class GoutouStore {
 enum CredentialVault {
     static let services = ["deepseek", "openrouter", "jev"]
     #if os(iOS)
-    private static func query(_ name: String) throws -> [String: Any] {
-        guard services.contains(name), let group = Bundle.main.object(forInfoDictionaryKey: "GoutouKeychainGroup") as? String,
-              !group.contains("$("), !group.isEmpty else { throw GoutouError.invalid("共享钥匙串配置未完成，请检查两个 target 的 Keychain Sharing") }
-        return [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "ai.goutoujunshi.ios." + name,
-                kSecAttrAccount as String: "default", kSecAttrAccessGroup as String: group]
+    /// 免费签名 / Sideload 时，自定义 keychain access group 拿不到授权（SecItem 返回 -34018），
+    /// 所以凭据优先写进 App Group 容器里的文件：App 与键盘都能读，且不需要额外 entitlement。
+    /// keychain 保留为兜底——正常 Team 签名下它依然可用，之前存进去的 key 也能读回来。
+    private static var groupContainer: URL? {
+        guard let group = Bundle.main.object(forInfoDictionaryKey: "GoutouAppGroup") as? String,
+              !group.contains("$("), !group.isEmpty else { return nil }
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
     }
-    static func read(_ name: String) throws -> String {
-        var query = try query(name)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecItemNotFound { return "" }
-        guard status == errSecSuccess, let data = item as? Data, let value = String(data: data, encoding: .utf8) else {
-            throw GoutouError.invalid("钥匙串读取失败（\(status)），请检查共享权限")
+
+    private static var fileURL: URL? {
+        groupContainer?.appendingPathComponent("credentials.json")
+    }
+
+    private static func readFileMap() -> [String: String] {
+        guard let url = fileURL, let data = try? Data(contentsOf: url),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return map
+    }
+
+    private static func writeFileMap(_ map: [String: String]) throws {
+        guard let url = fileURL else { throw GoutouError.invalid("共享容器不可用，无法保存密钥") }
+        let data = try JSONEncoder().encode(map)
+        try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    private static var declaredGroup: String? {
+        guard let group = Bundle.main.object(forInfoDictionaryKey: "GoutouKeychainGroup") as? String,
+              !group.contains("$("), !group.isEmpty else { return nil }
+        return group
+    }
+
+    private static func keychainQuery(_ name: String, group: String?) -> [String: Any] {
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: "ai.goutoujunshi.ios." + name,
+                                    kSecAttrAccount as String: "default"]
+        if let group { query[kSecAttrAccessGroup as String] = group }
+        return query
+    }
+
+    private static func keychainRead(_ name: String) -> String? {
+        for group in [declaredGroup, nil] {
+            var query = keychainQuery(name, group: group)
+            query[kSecReturnData as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            var item: CFTypeRef?
+            if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+               let data = item as? Data, let value = String(data: data, encoding: .utf8), !value.isEmpty {
+                return value
+            }
         }
-        return value
+        return nil
     }
+
+    private static func keychainWrite(_ name: String, _ value: String) -> Bool {
+        for group in [declaredGroup, nil] {
+            let query = keychainQuery(name, group: group)
+            let attributes: [String: Any] = [kSecValueData as String: Data(value.utf8),
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+            var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+            if status == errSecItemNotFound {
+                status = SecItemAdd(query.merging(attributes, uniquingKeysWith: { _, new in new }) as CFDictionary, nil)
+            }
+            if status == errSecSuccess { return true }
+        }
+        return false
+    }
+
+    static func read(_ name: String) throws -> String {
+        guard services.contains(name) else { throw GoutouError.invalid("未知的凭据名：\(name)") }
+        if let value = readFileMap()[name], !value.isEmpty { return value }
+        return keychainRead(name) ?? ""
+    }
+
     static func write(_ value: String, name: String) throws {
         let value = value.trimmed
+        guard services.contains(name) else { throw GoutouError.invalid("未知的凭据名：\(name)") }
         guard !value.isEmpty, value.count <= 1024 else { throw GoutouError.invalid("请输入有效的 API Key") }
-        let query = try query(name)
-        let attributes: [String: Any] = [kSecValueData as String: Data(value.utf8),
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
-        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            status = SecItemAdd(query.merging(attributes, uniquingKeysWith: { _, new in new }) as CFDictionary, nil)
+        if fileURL != nil {
+            var map = readFileMap()
+            map[name] = value
+            if (try? writeFileMap(map)) != nil { return }
         }
-        guard status == errSecSuccess else { throw GoutouError.invalid("密钥保存失败（\(status)），请检查共享钥匙串签名") }
+        if keychainWrite(name, value) { return }
+        throw GoutouError.invalid("密钥保存失败：共享容器与钥匙串都不可用（检查 App Group 签名）")
     }
+
     static func delete(_ name: String) throws {
-        let status = SecItemDelete(try query(name) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw GoutouError.invalid("无法删除密钥（\(status)）") }
+        guard services.contains(name) else { throw GoutouError.invalid("未知的凭据名：\(name)") }
+        if fileURL != nil {
+            var map = readFileMap()
+            if map.removeValue(forKey: name) != nil { try? writeFileMap(map) }
+        }
+        for group in [declaredGroup, nil] {
+            _ = SecItemDelete(keychainQuery(name, group: group) as CFDictionary)
+        }
     }
     #else
     static func read(_ name: String) throws -> String { "" }
