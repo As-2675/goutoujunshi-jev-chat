@@ -40,26 +40,45 @@ struct SendChatScreenshotToKeyboardIntent: AppIntent {
         Summary("把 \(\.$screenshot) 交给键盘，按配置识别")
     }
 
+    @MainActor
     func perform() async throws -> some IntentResult {
         try Task.checkCancellation()
         let store = try GoutouStore()
-        guard let request = store.captureMailbox.request(),
-              request.relationship == store.relationship(), request.config == store.config() else {
-            throw GoutouError.invalid("请先切换到狗头军师键盘，点“识图”进入等待页，再运行这个快捷指令。等待有效期为 90 秒。")
+        // 免费签名（个人 Apple ID）的包拿不到 App Group：键盘写下的等待请求在这里读不到，
+        // 旧逻辑会一直报“请先切换到狗头军师键盘…”。所以不再强制要求等待页：
+        // 有请求就沿用它的裁切参数，没有就用主 App 自己的配置；结果放进剪贴板，键盘轮询取走。
+        var active = store.captureMailbox.request()
+        if active == nil || active?.relationship != store.relationship() || active?.config != store.config() {
+            active = KeyboardCaptureRequest(relationship: store.relationship(),
+                                            config: store.config(),
+                                            excludedBottomFraction: 0.46)
         }
+        guard let request = active else { return .result() }
+
+        // 结果连同主 App 当前的配置与密钥一起塞进剪贴板：键盘拿到结果的同时就把配置补齐，
+        // 免得还要手动“复制配置 → 导入”两步。
+        @MainActor
+        func publish(_ result: KeyboardCaptureResult) {
+            var secrets: [String: String] = [:]
+            for name in CredentialVault.services { secrets[name] = (try? CredentialVault.read(name)) ?? "" }
+            GoutouClipboard.publishCapture(result, config: store.config(),
+                                           relationship: store.relationship(), secrets: secrets,
+                                           profiles: store.archived())
+        }
+
         do {
             let jpeg = try LocalOCR.boundedJPEG(screenshot.data, maxPixelSize: 1600,
                                                 excludedBottomFraction: request.excludedBottomFraction)
             let result = try await CaptureOCR.prepare(jpeg, request: request)
             try Task.checkCancellation()
-            guard request.relationship == store.relationship(), request.config == store.config() else {
-                throw GoutouError.invalid("对象或配置已变化，请重新点“识图”")
-            }
-            try store.captureMailbox.publish(result)
+            publish(result)
+            try? store.captureMailbox.publish(result)
         } catch {
             if !(error is CancellationError) {
-                try? store.captureMailbox.publish(KeyboardCaptureResult(request: request, transcript: "",
-                                                                         error: error.localizedDescription))
+                let failed = KeyboardCaptureResult(request: request, transcript: "",
+                                                  error: error.localizedDescription)
+                publish(failed)
+                try? store.captureMailbox.publish(failed)
             }
             throw error
         }
