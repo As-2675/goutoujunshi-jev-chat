@@ -59,6 +59,11 @@ struct ProviderView: View {
             } footer: {
                 Text("密钥保存在 App 与键盘共享的本机钥匙串，已存 Key 不回显；空白表示保留原 Key。聊天仅在你确认分析时发送到所选接口。")
             }
+            Section("键盘同步（免费签名必看）") {
+                Button("复制配置与密钥给键盘") { copyForKeyboard() }
+                Text("免费签名拿不到 App Group，键盘读不到这里的配置和 Key。点一下把整份配置放进剪贴板，再到键盘点「从剪贴板导入配置」。会覆盖当前剪贴板内容。")
+                    .font(.caption).foregroundStyle(Palette.secondary)
+            }
             Section("本地数据") {
                 Button("清除键盘暂存与等待取用的内容") {
                     model.store?.clearHandoff(); model.store?.captureMailbox.clear(); model.store?.clearKeyboardSession()
@@ -116,6 +121,17 @@ struct ProviderView: View {
             refreshKeys(); model.reload(); message = "已保存，下一次键盘分析使用新配置。"
         } catch { message = error.localizedDescription }
     }
+    private func copyForKeyboard() {
+        guard let store = model.store else { message = "共享存储未就绪，先保存一次配置"; return }
+        var secrets: [String: String] = [:]
+        for name in CredentialVault.services { secrets[name] = (try? CredentialVault.read(name)) ?? "" }
+        let payload = GoutouHandoffPayload(config: store.config(), relationship: store.relationship(),
+                                           secrets: secrets, profiles: store.archived(), createdAt: Date())
+        message = GoutouClipboard.publishConfig(payload)
+            ? "已复制：切到狗头军师键盘，点「从剪贴板导入配置」"
+            : "复制失败，请重试"
+    }
+
     private func testButton(_ title: String, provider: ReplyProvider) -> some View {
         Button(title) {
             do {
