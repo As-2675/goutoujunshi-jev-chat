@@ -1,11 +1,18 @@
 # =============================================================================
-# 云构建「未签名 IPA」——给没有 Mac 的人用
+# 云构建「未签名真机 IPA」
 #
 # 放到仓库的：  .github/workflows/ios-unsigned-ipa.yml
 #
-# 产物：<AppName>-unsigned.ipa（Payload/<AppName>.app，arm64，device 构建）
-#       这个包本身不能直装 iPhone，需要用 Sideloadly / AltStore 用你自己的
-#       Apple ID 重签后才能安装（详见同目录 README）。
+# 产物：GoutouJunshi-unsigned.ipa（Payload/GoutouJunshi.app，arm64，device 构建）
+#       包本身不能直装 iPhone，需要 Sideloadly / AltStore 用你自己的 Apple ID
+#       重签后才能安装（详见同目录 README）。
+#
+# 两个出口，任选其一：
+#   1. Actions → 本次运行 → Artifacts → GoutouJunshi-unsigned-ipa
+#   2. 分支 unsigned-ipa（workflow 会把 ipa 单独提交到一个 orphan 分支），
+#      可直接 https://codeload.github.com/<owner>/<repo>/zip/refs/heads/unsigned-ipa
+#      下载 zip 后解压拿包 —— 给 github.com 被墙、objects.githubusercontent.com
+#      连不上的网络用。
 #
 # 已按 shengjidaguai-china/goutoujunshi-jev-chat 的实际结构预设：
 #   project = integrations/jev_ios/GoutouJunshi.xcodeproj
@@ -29,7 +36,7 @@ on:
       - ".github/workflows/ios-unsigned-ipa.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ios-unsigned-ipa-${{ github.ref }}
@@ -81,7 +88,7 @@ jobs:
           echo "本次使用： project=${PROJ}  scheme=${SCHEME}"
           xcodebuild -list -project "${PROJ}"
 
-      - name: 编译（关闭代码签名）
+      - name: 编译（关闭代码签名，device / arm64）
         shell: bash
         env:
           PROJ: ${{ steps.probe.outputs.project }}
@@ -118,10 +125,11 @@ jobs:
           ls "${APP}/PlugIns" 2>/dev/null || echo "(没有 PlugIns 目录)"
 
           STAGE="${RUNNER_TEMP}/stage"
+          rm -rf "${STAGE}"
           mkdir -p "${STAGE}/Payload"
           cp -R "${APP}" "${STAGE}/Payload/"
 
-          IPA="${GITHUB_WORKSPACE}/${APP_NAME}-unsigned.ipa"
+          IPA="${RUNNER_TEMP}/${APP_NAME}-unsigned.ipa"
           ( cd "${STAGE}" && ditto -c -k --sequesterRsrc --keepParent Payload "${IPA}" )
 
           echo "ipa=${IPA}" >> "${GITHUB_OUTPUT}"
@@ -134,6 +142,7 @@ jobs:
           file "${APP}/${BIN}" || true
           echo "最小系统版本："
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "${APP}/Info.plist" || true
+          shasum -a 256 "${IPA}"
           ls -lh "${IPA}"
 
       - name: 上传 artifact
@@ -144,14 +153,40 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: 把 ipa 推到 unsigned-ipa 分支（给受限网络直接下载）
+        if: success()
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.pack.outputs.ipa }}
+          APP_NAME: ${{ steps.pack.outputs.app_name }}
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/ipa-branch"
+          rm -rf "${OUT}"
+          mkdir -p "${OUT}"
+          cp "${IPA_PATH}" "${OUT}/${APP_NAME}-unsigned.ipa"
+          ( cd "${OUT}" && shasum -a 256 *.ipa > SHA256SUMS.txt )
+
+          cd "${OUT}"
+          git init -q
+          git checkout -q -b unsigned-ipa
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "unsigned ipa $(date -u +%Y%m%dT%H%M%SZ)"
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" unsigned-ipa
+          echo "已推送：https://codeload.github.com/${GITHUB_REPOSITORY}/zip/refs/heads/unsigned-ipa"
+
       - name: 结果摘要
+        if: always()
         shell: bash
         run: |
           {
-            echo "### 构建完成"
+            echo "### 构建${{ job.status }}"
             echo ""
             echo "- App：\`${{ steps.pack.outputs.app_name }}\`"
-            echo "- 产物：\`${{ steps.pack.outputs.ipa }}\`"
             echo "- 这个包是**未签名**的，不能直接安装到 iPhone。"
-            echo "- 下一步：下载 artifact → 用 Sideloadly 以你的 Apple ID 重签安装。"
+            echo "- 下载：本次运行 Artifacts，或分支 \`unsigned-ipa\` 的 zip。"
+            echo "- 下一步：Sideloadly 用你的 Apple ID 重签安装。"
           } >> "${GITHUB_STEP_SUMMARY}"
