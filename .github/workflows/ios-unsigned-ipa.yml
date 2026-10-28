@@ -159,6 +159,8 @@ jobs:
         env:
           IPA_PATH: ${{ steps.pack.outputs.ipa }}
           APP_NAME: ${{ steps.pack.outputs.app_name }}
+          # run 步骤里没有默认的 GITHUB_TOKEN 环境变量，必须显式映射
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           OUT="${RUNNER_TEMP}/ipa-branch"
@@ -174,9 +176,13 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -q -m "unsigned ipa $(date -u +%Y%m%dT%H%M%SZ)"
-          git push -q --force \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" unsigned-ipa
-          echo "已推送：https://codeload.github.com/${GITHUB_REPOSITORY}/zip/refs/heads/unsigned-ipa"
+          if git push -q --force \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" unsigned-ipa; then
+            echo "已推送：https://codeload.github.com/${GITHUB_REPOSITORY}/zip/refs/heads/unsigned-ipa"
+          else
+            # 分支只是「受限网络下载」的备用通道，失败不影响 Artifacts 里的成品
+            echo "::warning::推送到 unsigned-ipa 分支失败，请用本次运行的 Artifacts 下载"
+          fi
 
       - name: 结果摘要
         if: always()
