@@ -13,6 +13,10 @@ final class PinyinEngine: Sendable {
     private struct Path { let text: String; let score: Double }
     private let words: [String: [Word]]
     private let codes: [String]
+    /// 九宫格（T9）索引：数字串 → 拼音码。dictionary 的码本身就是纯字母，
+    /// 直接把每个码映射成 2–9 的数字串，用户敲数字就等于敲了一条前缀。
+    private let digitIndex: [String: [String]]
+    private let digitKeys: [String]
     let entryCount: Int
     private let beamWidth = 5
 
@@ -36,7 +40,68 @@ final class PinyinEngine: Sendable {
                 $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 > $1.1
             }.prefix(12).map { Word(text: $0.0, score: log(max(1, $0.1)) - 18, boundaries: $0.2) }
         }
+        var byDigit = [String: [String]]()
+        for code in index.keys {
+            let digits = Self.digits(of: code)
+            guard !digits.isEmpty else { continue }
+            byDigit[digits, default: []].append(code)
+        }
+        digitIndex = byDigit
+        digitKeys = byDigit.keys.sorted()
         words = index; codes = index.keys.sorted(); entryCount = count
+    }
+
+    /// 九宫格输入：数字串按 T9 映射到拼音码（含前缀补全），候选沿用同一份词库排序。
+    /// 缺点是不支持任意字母串，好处是不用做数字→字母的组合爆炸。
+    func candidates(forDigits digits: String, limit: Int = 24) -> [PinyinCandidate] {
+        guard !digits.isEmpty, digits.count <= 24, limit > 0,
+              digits.utf8.allSatisfy({ $0 >= 50 && $0 <= 57 }) else { return [] }
+        var scored = [(text: String, score: Double)]()
+        var scanned = 0
+        for key in digitKeysFrom(digits) {
+            scanned += 1
+            if scanned > 160 { break }
+            guard let codes = digitIndex[key] else { continue }
+            for code in codes.prefix(8) {
+                for word in (words[code] ?? []).prefix(3) {
+                    scored.append((word.text, word.score))
+                }
+            }
+        }
+        var seen = Set<String>()
+        return scored.sorted { $0.score == $1.score ? $0.text < $1.text : $0.score > $1.score }
+            .filter { seen.insert($0.text).inserted }
+            .prefix(limit)
+            .map { PinyinCandidate(text: $0.text, consumed: digits.count) }
+    }
+
+    private func digitKeysFrom(_ prefix: String) -> ArraySlice<String> {
+        var lower = 0, upper = digitKeys.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if digitKeys[middle] < prefix { lower = middle + 1 } else { upper = middle }
+        }
+        var end = lower
+        while end < digitKeys.count, digitKeys[end].hasPrefix(prefix), end - lower < 200 { end += 1 }
+        return digitKeys[lower..<end]
+    }
+
+    private static func digits(of code: String) -> String {
+        var result = ""
+        for byte in code.utf8 {
+            switch byte {
+            case 97, 98, 99: result += "2"          // abc
+            case 100, 101, 102: result += "3"       // def
+            case 103, 104, 105: result += "4"       // ghi
+            case 106, 107, 108: result += "5"       // jkl
+            case 109, 110, 111: result += "6"       // mno
+            case 112...115: result += "7"           // pqrs
+            case 116, 117, 118: result += "8"       // tuv
+            case 119, 120, 121, 122: result += "9"  // wxyz
+            default: return ""
+            }
+        }
+        return result
     }
 
     func candidates(for input: String, limit: Int = 24) -> [PinyinCandidate] {
