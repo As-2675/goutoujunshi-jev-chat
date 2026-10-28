@@ -3,7 +3,7 @@ import UIKit
 /// Typing stays entirely on-device, including when keyboard Full Access is disabled.
 @MainActor
 final class TypingKeyboardView: UIView {
-    private enum Layout { case letters, numbers, symbols }
+    private enum Layout { case letters, nine, numbers, symbols }
     var onInsert: ((String) -> Void)?
     var onDelete: (() -> Void)?
     var onMove: ((Int) -> Void)?
@@ -12,6 +12,8 @@ final class TypingKeyboardView: UIView {
     private var uppercase = false
     private var layout: Layout = .letters
     private var composition = PinyinComposition()
+    /// 九宫格输入态（数字串）；与 composition（字母串）互斥，切布局时清空对应一侧。
+    private var nineInput = ""
     private var engine: PinyinEngine?
     private var candidates = [PinyinCandidate]()
     private var lookupRevision = 0
@@ -25,9 +27,10 @@ final class TypingKeyboardView: UIView {
     private var compact = false
     private var preeditHeight: NSLayoutConstraint!
     private var candidatesHeight: NSLayoutConstraint!
-    private var keyHeight: CGFloat { compact ? 32 : 44 }
+    /// 九宫格多一行键位，单键压到 40 才能在 326pt 的面板里放下。
+    private var keyHeight: CGFloat { compact ? 32 : (layout == .nine ? 40 : 44) }
 
-    var hasComposition: Bool { !composition.raw.isEmpty }
+    var hasComposition: Bool { layout == .nine ? !nineInput.isEmpty : !composition.raw.isEmpty }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -63,7 +66,7 @@ final class TypingKeyboardView: UIView {
     deinit { deleteTimer?.invalidate() }
 
     func clearComposition() {
-        composition.clear(); lookupRevision += 1; candidates = []; renderCandidates()
+        composition.clear(); nineInput = ""; lookupRevision += 1; candidates = []; renderCandidates()
         deleteTimer?.invalidate(); deleteTimer = nil
     }
     func setCompactLayout(_ value: Bool) {
@@ -79,11 +82,11 @@ final class TypingKeyboardView: UIView {
         super.didMoveToWindow()
         if window == nil { deleteTimer?.invalidate(); deleteTimer = nil }
     }
-    private func key(_ title: String, identifier: String? = nil, utility: Bool = false, action: @escaping () -> Void) -> UIButton {
+    private func key(_ title: String, identifier: String? = nil, utility: Bool = false, fixedHeight: Bool = true, action: @escaping () -> Void) -> UIButton {
         let button = UIButton(type: .system)
         var config = UIButton.Configuration.filled()
         config.title = title; config.cornerStyle = .fixed
-        config.background.cornerRadius = 6
+        config.background.cornerRadius = 9
         config.baseBackgroundColor = utility ? KB.highlight : KB.surface
         config.baseForegroundColor = KB.ink
         config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0)
@@ -95,7 +98,7 @@ final class TypingKeyboardView: UIView {
         button.layer.shadowOpacity = 0.12; button.layer.shadowRadius = 0
         button.layer.shadowOffset = CGSize(width: 0, height: 1)
         button.accessibilityIdentifier = identifier
-        button.heightAnchor.constraint(equalToConstant: keyHeight).isActive = true
+        if fixedHeight { button.heightAnchor.constraint(equalToConstant: keyHeight).isActive = true }
         button.addAction(UIAction { _ in action() }, for: .touchUpInside)
         return button
     }
@@ -116,8 +119,8 @@ final class TypingKeyboardView: UIView {
         row.axis = .horizontal; row.spacing = compact ? 4 : 5; row.distribution = .fillEqually
         return row
     }
-    private func deleteKey() -> UIButton {
-        let button = key("⌫", identifier: "typingBackspace", utility: true) { [weak self] in self?.backspace() }
+    private func deleteKey(fixedHeight: Bool = true) -> UIButton {
+        let button = key("⌫", identifier: "typingBackspace", utility: true, fixedHeight: fixedHeight) { [weak self] in self?.backspace() }
         button.accessibilityLabel = "删除"
         let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdDelete(_:)))
         hold.minimumPressDuration = 0.4
@@ -157,6 +160,71 @@ final class TypingKeyboardView: UIView {
             shift.widthAnchor.constraint(equalTo: third.widthAnchor, multiplier: 0.11).isActive = true
             third.arrangedSubviews.last!.widthAnchor.constraint(equalTo: shift.widthAnchor).isActive = true
             keys.addArrangedSubview(third)
+        case .nine:
+            // 参考 iOS 自带九宫格：左侧一列标点、中间 3×3 数字键、右侧 ⌫/换行，
+            // 底部一条「符号 / 123 / 空格 / 中英 / 地球」。数字键走 T9，小字是字母组。
+            let punctKeys = ["@", "?", "。", "…"].map { value -> UIButton in
+                let button = key(value, identifier: "typingNinePunct", utility: false, fixedHeight: false) { [weak self] in
+                    self?.insertPunctuation(value)
+                }
+                button.accessibilityLabel = value
+                return button
+            }
+            let leftColumn = UIStackView(arrangedSubviews: punctKeys)
+            leftColumn.axis = .vertical; leftColumn.spacing = 3; leftColumn.distribution = .fillEqually
+
+            let grid = [("1", "，"), ("2", "abc"), ("3", "def"),
+                        ("4", "ghi"), ("5", "jkl"), ("6", "mno"),
+                        ("7", "pqrs"), ("8", "tuv"), ("9", "wxyz")]
+            let gridStack = UIStackView()
+            gridStack.axis = .vertical; gridStack.spacing = 7
+            for base in stride(from: 0, to: 9, by: 3) {
+                gridStack.addArrangedSubview(keyRow((base..<base + 3).map { digitKey(grid[$0].0, letters: grid[$0].1) }))
+            }
+
+            let returnKey = key("换行", identifier: "typingNineReturn", utility: true, fixedHeight: false) { [weak self] in
+                guard let self = self else { return }
+                self.commitComposition(); self.onInsert?("\n")
+            }
+            let rightColumn = UIStackView(arrangedSubviews: [deleteKey(fixedHeight: false), returnKey])
+            rightColumn.axis = .vertical; rightColumn.spacing = 3; rightColumn.distribution = .fillEqually
+
+            let mainRow = UIStackView(arrangedSubviews: [leftColumn, gridStack, rightColumn])
+            mainRow.axis = .horizontal; mainRow.spacing = 6; mainRow.alignment = .fill
+            leftColumn.widthAnchor.constraint(equalTo: keys.widthAnchor, multiplier: 0.14).isActive = true
+            rightColumn.widthAnchor.constraint(equalTo: keys.widthAnchor, multiplier: 0.17).isActive = true
+            keys.addArrangedSubview(mainRow)
+
+            let symbolKey = key("符号", identifier: "typingNineSymbols", utility: true) { [weak self] in
+                guard let self = self else { return }
+                self.commitComposition(); self.layout = .symbols; self.renderKeys()
+            }
+            let numbersKey = key("123", identifier: "typingNineNumbers", utility: true) { [weak self] in
+                guard let self = self else { return }
+                self.commitComposition(); self.layout = .numbers; self.renderKeys()
+            }
+            let spaceKey = key("空格", identifier: "typingNineSpace") { [weak self] in
+                guard let self = self else { return }
+                if self.hasComposition { self.commitComposition() } else { self.onInsert?(" ") }
+            }
+            spaceKey.accessibilityLabel = "空格"
+            let languageKey = key(chinese ? "中" : "英", identifier: "typingNineLanguage", utility: true) { [weak self] in
+                guard let self = self else { return }
+                self.commitComposition(); self.chinese.toggle(); self.renderKeys(); self.renderCandidates()
+            }
+            languageKey.accessibilityLabel = chinese ? "中文输入，点击切换英文" : "英文输入，点击切换中文"
+            let globeKey = key("", identifier: "typingNineGlobe", utility: true) {}
+            globeKey.configuration?.image = UIImage(systemName: "globe")
+            globeKey.accessibilityLabel = "切换到其他键盘"
+            onKeyboardButtonCreated?(globeKey)
+            let bottom = UIStackView(arrangedSubviews: [symbolKey, numbersKey, spaceKey, languageKey, globeKey])
+            bottom.axis = .horizontal; bottom.spacing = 5; bottom.distribution = .fill
+            symbolKey.widthAnchor.constraint(equalTo: bottom.widthAnchor, multiplier: 0.14).isActive = true
+            numbersKey.widthAnchor.constraint(equalTo: bottom.widthAnchor, multiplier: 0.14).isActive = true
+            languageKey.widthAnchor.constraint(equalTo: bottom.widthAnchor, multiplier: 0.16).isActive = true
+            globeKey.widthAnchor.constraint(equalTo: bottom.widthAnchor, multiplier: 0.14).isActive = true
+            keys.addArrangedSubview(bottom)
+            return
         case .numbers, .symbols:
             let rows = layout == .numbers ? ["1234567890", "-/:;()¥&@\""] : ["[]{}#%^*+=", "_\\|~<>€£•$"]
             rows.forEach { keys.addArrangedSubview(letterRow($0)) }
@@ -166,8 +234,23 @@ final class TypingKeyboardView: UIView {
             let punctuation = chinese ? ["，", "。", "？", "！", "、", "…", "'" ] : [",", ".", "?", "!", ":", ";", "'"]
             keys.addArrangedSubview(keyRow([page] + punctuation.map { value in key(value) { [weak self] in self?.insertPunctuation(value) } } + [deleteKey()]))
         }
-        let alphabet = key(layout == .letters ? "123" : "ABC", identifier: "typingLayout", utility: true) { [weak self] in
-            guard let self = self else { return }; self.commitComposition(); self.layout = self.layout == .letters ? .numbers : .letters; self.renderKeys()
+        let alphabetTitle: String
+        switch layout {
+        case .letters: alphabetTitle = "123"
+        case .numbers: alphabetTitle = "九宫"
+        case .nine: alphabetTitle = "ABC"
+        case .symbols: alphabetTitle = "123"
+        }
+        let alphabet = key(alphabetTitle, identifier: "typingLayout", utility: true) { [weak self] in
+            guard let self = self else { return }
+            self.commitComposition()
+            switch self.layout {
+            case .letters: self.layout = .numbers
+            case .numbers: self.layout = .nine
+            case .nine: self.layout = .letters
+            case .symbols: self.layout = .numbers
+            }
+            self.renderKeys(); self.renderCandidates()
         }
         let language = key(chinese ? "中" : "英", identifier: "typingLanguage", utility: true) { [weak self] in
             guard let self = self else { return }; self.commitComposition(); self.chinese.toggle(); self.renderKeys(); self.renderCandidates()
@@ -199,12 +282,50 @@ final class TypingKeyboardView: UIView {
             composition.append(character); refreshCandidates()
         } else { onInsert?(uppercase && layout == .letters ? character.uppercased() : character) }
     }
+    private func typeDigit(_ digit: String) {
+        guard layout == .nine else { onInsert?(digit); return }
+        guard nineInput.count < 24 else { return }
+        nineInput += digit
+        refreshCandidates()
+    }
+
+    /// 九宫格键：大字是数字，小字是该键的字母组（abc / def …）。
+    private func digitKey(_ digit: String, letters: String) -> UIButton {
+        let button = key(digit, identifier: "typingDigit_" + digit) { [weak self] in self?.typeDigit(digit) }
+        if var config = button.configuration {
+            config.subtitle = letters
+            config.titleAlignment = .center
+            config.subtitleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+                var result = incoming
+                result.font = .systemFont(ofSize: 10, weight: .medium)
+                return result
+            }
+            config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+                var result = incoming
+                result.font = UIFont.systemFont(ofSize: 22, weight: .semibold)
+                return result
+            }
+            button.configuration = config
+        }
+        button.accessibilityLabel = "\(digit) \(letters)"
+        return button
+    }
     private func insertPunctuation(_ value: String) { commitComposition(); onInsert?(value) }
     private func backspace() {
+        if layout == .nine {
+            if !nineInput.isEmpty { nineInput.removeLast(); refreshCandidates(); return }
+            onDelete?(); return
+        }
         if composition.backspace() { refreshCandidates() } else { onDelete?() }
     }
     private func commitComposition() {
         guard hasComposition else { return }
+        if layout == .nine {
+            if let first = candidates.first { onInsert?(first.text) }
+            nineInput = ""
+            refreshCandidates()
+            return
+        }
         // Never insert an incomplete leading-word candidate while dropping the remaining syllables.
         let available = candidates.isEmpty ? (engine?.candidates(for: composition.raw) ?? []) : candidates
         if let candidate = available.first, candidate.consumed == composition.raw.count,
@@ -214,23 +335,28 @@ final class TypingKeyboardView: UIView {
     }
     private func refreshCandidates() {
         lookupRevision += 1
-        let revision = lookupRevision, raw = composition.raw
+        let revision = lookupRevision
+        let nine = layout == .nine
+        let raw = nine ? nineInput : composition.raw
         candidates = []; renderCandidates()
         guard !raw.isEmpty, let engine = engine else { return }
         lookupQueue.async { [weak self] in
-            let result = engine.candidates(for: raw)
+            let result = nine ? engine.candidates(forDigits: raw) : engine.candidates(for: raw)
             DispatchQueue.main.async { [weak self] in
-                guard let self = self, self.lookupRevision == revision, self.composition.raw == raw else { return }
+                guard let self = self, self.lookupRevision == revision else { return }
+                let current = self.layout == .nine ? self.nineInput : self.composition.raw
+                guard current == raw else { return }
                 self.candidates = result; self.renderCandidates()
             }
         }
     }
     private func renderCandidates() {
-        preedit.text = composition.raw.isEmpty ? (chinese ? "中文拼音 · 本地输入" : "英文 · 本地输入") : composition.raw
+        let raw = layout == .nine ? nineInput : composition.raw
+        preedit.text = raw.isEmpty ? (chinese ? "中文拼音 · 本地输入" : "英文 · 本地输入") : raw
         preedit.textColor = KB.secondary
         candidateRow.arrangedSubviews.forEach { $0.removeFromSuperview() }
         candidateScroll.contentOffset = .zero
-        if composition.raw.isEmpty {
+        if raw.isEmpty {
             for value in (chinese ? ["。", "？", "！", "😊", "👍", "❤️"] : [".", "?", "!", "😊", "👍", "❤️"]) {
                 candidateRow.addArrangedSubview(key(value) { [weak self] in self?.insertPunctuation(value) })
             }
@@ -239,17 +365,25 @@ final class TypingKeyboardView: UIView {
         } else {
             for (index, candidate) in candidates.enumerated() {
                 let button = key(candidate.text, identifier: "pinyinCandidate_\(index)") { [weak self] in
-                    guard let self = self, let text = self.composition.select(candidate) else { return }
+                    guard let self = self else { return }
+                    if self.layout == .nine {
+                        self.nineInput = ""
+                        self.onInsert?(candidate.text)
+                        self.refreshCandidates()
+                        return
+                    }
+                    guard let text = self.composition.select(candidate) else { return }
                     self.onInsert?(text); self.refreshCandidates()
                 }
                 button.accessibilityLabel = "拼音候选：" + candidate.text
                 candidateRow.addArrangedSubview(button)
             }
-            let raw = composition.raw
-            candidateRow.addArrangedSubview(key(raw, identifier: "pinyinRaw") { [weak self] in
-                guard let self = self, self.composition.raw == raw else { return }
-                self.composition.clear(); self.onInsert?(raw); self.refreshCandidates()
-            })
+            if layout != .nine {
+                candidateRow.addArrangedSubview(key(raw, identifier: "pinyinRaw") { [weak self] in
+                    guard let self = self, self.composition.raw == raw else { return }
+                    self.composition.clear(); self.onInsert?(raw); self.refreshCandidates()
+                })
+            }
         }
         for case let button as UIButton in candidateRow.arrangedSubviews {
             let title = button.configuration?.title ?? ""
